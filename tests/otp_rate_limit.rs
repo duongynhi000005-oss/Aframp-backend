@@ -220,3 +220,32 @@ async fn consumed_challenge_cannot_be_reused() {
     assert_eq!(json["code"], "OTP_CHALLENGE_NOT_FOUND");
     assert!(json.get("token").is_none(), "replay must not issue a token");
 }
+
+#[tokio::test]
+async fn consumed_challenges_do_not_count_towards_hourly_limit() {
+    let (app, db) = app_and_db().await;
+    let (body, phone) = fresh_signup("otp_consumed_hourly");
+
+    // Five consumed challenges within the hour — verified so consumed_at IS NOT NULL
+    for n in 1..=5 {
+        let (status, challenge) = signup(&app, &body).await;
+        assert_eq!(status, StatusCode::OK, "signup #{n} should succeed: {challenge}");
+        let challenge_id = challenge["challenge_id"].as_str().unwrap();
+        let code = last_code(&phone);
+
+        let (status, json) = verify(&app, challenge_id, &code).await;
+        assert_eq!(status, StatusCode::OK, "verify #{n} should succeed: {json}");
+
+        // Fast-forward last_sent_at past 60s cooldown so next request isn't blocked by cooldown
+        sqlx::query("UPDATE otp_challenges SET last_sent_at = now() - interval '61 seconds' WHERE id = $1::uuid")
+            .bind(Uuid::parse_str(challenge_id).unwrap())
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+
+    // A sixth challenge within the hour must succeed because all 5 prior challenges were consumed
+    let (status, sixth) = signup(&app, &body).await;
+    assert_eq!(status, StatusCode::OK, "sixth signup must succeed when prior challenges were consumed: {sixth}");
+    assert!(sixth["challenge_id"].as_str().is_some());
+}
